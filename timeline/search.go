@@ -434,9 +434,15 @@ func (tl *Timeline) prepareSearchQuery(ctx context.Context, params ItemSearchPar
 
 	// TODO: use strings.Builder (also in RecentConversations())
 
-	q += fmt.Sprintf("\t\tSELECT %s, entities.id, entities.name, entities.picture_file, attributes.name, attributes.value, attributes.alt_value, embeddings.id", itemDBColumns)
+	// Note: Every join in this query must produce at most one row per item. We used to
+	// join the relationships and embeddings tables directly and then deduplicate with
+	// "GROUP BY items.id", but grouping prevents SQLite from using the timestamp index
+	// for ORDER BY and range filters, so every search scanned and sorted the entire
+	// items table. Instead, related tables are consulted with subqueries.
+	q += fmt.Sprintf("\t\tSELECT %s, entities.id, entities.name, entities.picture_file, attributes.name, attributes.value, attributes.alt_value,"+
+		" (SELECT embeddings.id FROM embeddings WHERE embeddings.item_id = items.id LIMIT 1) AS embedding_id", itemDBColumns)
 	if params.OnlyTotal {
-		q = "\t\tSELECT count(DISTINCT items.id)"
+		q = "\t\tSELECT count()"
 	}
 	if params.GeoJSON {
 		// GeoJSON mode is intended to be more efficient; as such, only select coordinate data
@@ -445,22 +451,26 @@ func (tl *Timeline) prepareSearchQuery(ctx context.Context, params ItemSearchPar
 	if params.WithTotal {
 		q += ", count() over() AS total_count"
 	}
+	// An attribute may be linked to more than one entity, or to the same entity more
+	// than once (an identity on several data sources), so pick just one link; prefer
+	// an entity that is being filtered for, so that it is the one returned.
+	entityPreference := "ea.entity_id"
+	if len(params.EntityID) > 0 {
+		ids := make([]string, len(params.EntityID))
+		for i, id := range params.EntityID {
+			ids[i] = strconv.FormatUint(id, 10)
+		}
+		entityPreference = fmt.Sprintf("ea.entity_id IN (%s) DESC, ea.entity_id", strings.Join(ids, ", "))
+	}
 	q += `
 		FROM extended_items AS items
 		LEFT JOIN attributes ON items.attribute_id = attributes.id
-		LEFT JOIN entity_attributes ON attributes.id = entity_attributes.attribute_id
-		LEFT JOIN entities ON entity_attributes.entity_id = entities.id
-		LEFT JOIN embeddings ON embeddings.item_id = items.id`
-
-	// TODO: It's possible that we could move all these (ToAttributeID, ToEntityID, rootItemsOnly) into RelationParams
-	if len(params.ToAttributeID) > 0 || len(params.ToEntityID) > 0 {
-		q += `
-		JOIN relationships ON relationships.from_item_id = items.id`
-	} else if rootItemsOnly || len(params.Relations) > 0 {
-		q += `
-		LEFT JOIN relationships ON relationships.to_item_id = items.id
-		LEFT JOIN relations ON relations.id = relationships.relation_id`
-	}
+		LEFT JOIN entity_attributes ON entity_attributes.id = (
+			SELECT ea.id FROM entity_attributes AS ea
+			WHERE ea.attribute_id = attributes.id
+			ORDER BY ` + entityPreference + `
+			LIMIT 1)
+		LEFT JOIN entities ON entity_attributes.entity_id = entities.id`
 
 	// build the WHERE in terms of groups of OR's that are AND'ed together
 	var args []any
@@ -486,13 +496,16 @@ func (tl *Timeline) prepareSearchQuery(ctx context.Context, params ItemSearchPar
 		q = strings.TrimSuffix(q, " AND ()")
 		q = strings.TrimSuffix(q, "\n\t\tWHERE ()")
 	}
-	or := func(clause string, val any) {
+	orArgs := func(clause string, vals ...any) {
 		if clauseCount > 0 {
 			q += " OR "
 		}
 		q += clause
-		args = append(args, val)
+		args = append(args, vals...)
 		clauseCount++
+	}
+	or := func(clause string, val any) {
+		orArgs(clause, val)
 	}
 
 	and(func() {
@@ -582,15 +595,29 @@ func (tl *Timeline) prepareSearchQuery(ctx context.Context, params ItemSearchPar
 		}
 	})
 
-	and(func() {
-		// TODO: these can probably be in the same 'AND' group like this, right?
-		for _, v := range params.ToAttributeID {
-			or("relationships.to_attribute_id=?", v)
+	// items that were sent (or otherwise directed) to certain attributes or entities
+	// TODO: It's possible that we could move all these (ToAttributeID, ToEntityID, rootItemsOnly) into RelationParams
+	if len(params.ToAttributeID) > 0 || len(params.ToEntityID) > 0 {
+		var toClauses []string
+		var toArgs []any
+		if len(params.ToAttributeID) > 0 {
+			toClauses = append(toClauses, "r.to_attribute_id IN ("+sqlPlaceholders(len(params.ToAttributeID))+")")
+			for _, v := range params.ToAttributeID {
+				toArgs = append(toArgs, v)
+			}
 		}
-		for _, v := range params.ToEntityID {
-			or("relationships.to_entity_id=?", v)
+		if len(params.ToEntityID) > 0 {
+			toClauses = append(toClauses, "r.to_attribute_id IN (SELECT attribute_id FROM entity_attributes WHERE entity_id IN ("+
+				sqlPlaceholders(len(params.ToEntityID))+"))")
+			for _, v := range params.ToEntityID {
+				toArgs = append(toArgs, v)
+			}
 		}
-	})
+		and(func() {
+			orArgs("EXISTS (SELECT 1 FROM relationships AS r WHERE r.from_item_id = items.id AND ("+
+				strings.Join(toClauses, " OR ")+"))", toArgs...)
+		})
+	}
 
 	// TODO: Use BETWEEN maybe
 
@@ -670,31 +697,48 @@ func (tl *Timeline) prepareSearchQuery(ctx context.Context, params ItemSearchPar
 		})
 	}
 
+	// Conditions on the item's incoming relationships. Each group is a set of OR'ed
+	// conditions on a single relationship row. For an item to match, there must be
+	// one incoming relationship that satisfies all the groups, or (if every group
+	// would accept a missing relationship) the item must have no incoming relationships.
+	// (This is equivalent to the former LEFT JOIN of relationships + GROUP BY items.id.)
+	relGroups := make([]incomingRelCondition, 0, len(params.Relations)+1)
 	if rootItemsOnly {
 		// select only items which are not dependent on other items, i.e., items
 		// that are not at the end of a directed relation from another item
-		and(func() {
-			or("relations.directed != ?", 1)
-			or("relations.subordinating = ?", 0)
-			or("relationships.to_item_id IS ?", nil)
+		relGroups = append(relGroups, incomingRelCondition{
+			clauses:         []string{"rel.directed != ?", "rel.subordinating = ?"},
+			args:            []any{1, 0},
+			matchesNoneRows: true,
 		})
 	}
-
-	// factor in relationships
 	for _, relParam := range params.Relations {
+		if relParam.RelationLabel == "" {
+			continue
+		}
 		op := "IS"
 		if relParam.Not {
 			op = "IS NOT"
 		}
-		and(func() {
-			if relParam.RelationLabel != "" {
-				or("relations.label "+op+" ?", relParam.RelationLabel)
-			}
+		relGroups = append(relGroups, incomingRelCondition{
+			clauses:         []string{"rel.label " + op + " ?"},
+			args:            []any{relParam.RelationLabel},
+			matchesNoneRows: relParam.Not,
 		})
 	}
-
-	if !params.OnlyTotal {
-		q += "\n\t\tGROUP BY items.id"
+	if params.OrFields {
+		// each group is its own alternative
+		for _, group := range relGroups {
+			and(func() {
+				clause, clauseArgs := incomingRelationshipsClause([]incomingRelCondition{group})
+				orArgs(clause, clauseArgs...)
+			})
+		}
+	} else if len(relGroups) > 0 {
+		and(func() {
+			clause, clauseArgs := incomingRelationshipsClause(relGroups)
+			orArgs(clause, clauseArgs...)
+		})
 	}
 
 	// don't put order in the temporary table, since we'll be ordering by vector distance
@@ -812,6 +856,45 @@ ORDER BY distance`, targetVectorClause)
 	}
 
 	return q, args, nil
+}
+
+// incomingRelCondition is a group of OR'ed conditions on one incoming relationship
+// of an item (aliased "r", joined with its relation as "rel").
+type incomingRelCondition struct {
+	clauses []string
+	args    []any
+
+	// whether the condition would be satisfied by an item that has no incoming
+	// relationships (i.e. if the relationship and relation columns were NULL)
+	matchesNoneRows bool
+}
+
+// incomingRelationshipsClause returns a WHERE clause (and its arguments) that is
+// true if the item has an incoming relationship satisfying all the groups, or if
+// the item has no incoming relationships and all the groups accept that.
+func incomingRelationshipsClause(groups []incomingRelCondition) (string, []any) {
+	conds := make([]string, 0, len(groups))
+	var args []any
+	matchesNone := true
+	for _, g := range groups {
+		conds = append(conds, "("+strings.Join(g.clauses, " OR ")+")")
+		args = append(args, g.args...)
+		matchesNone = matchesNone && g.matchesNoneRows
+	}
+	clause := `EXISTS (SELECT 1 FROM relationships AS r JOIN relations AS rel ON rel.id = r.relation_id
+			WHERE r.to_item_id = items.id AND ` + strings.Join(conds, " AND ") + ")"
+	if matchesNone {
+		clause = "(" + clause + " OR NOT EXISTS (SELECT 1 FROM relationships AS r WHERE r.to_item_id = items.id))"
+	}
+	return clause, args
+}
+
+// sqlPlaceholders returns n comma-separated "?" placeholders.
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.Repeat("?, ", n-1) + "?"
 }
 
 func (tl *Timeline) expandRelationships(ctx context.Context, tx *sql.Tx, degrees int, sr *SearchResult) error {
