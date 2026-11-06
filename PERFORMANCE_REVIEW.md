@@ -13,7 +13,30 @@ Reviewed at commit `11ecc5a` (May 2026). Focus: why the app is slow on a server 
 | 5 | Thumbnails | Image thumbnails are **AVIF** (slow to encode on the CPU and slow for browsers to decode without hardware support). Missing thumbnails are generated **on demand while you browse** | Offer WebP/JPEG thumbnails as an option; make sure the thumbnail job has finished | Small |
 | 6 | HTTP | No compression, and no cache headers on static JS/CSS (about 3.5 MB of JS) or on thumbnails | Add gzip/zstd for JSON/JS/CSS, and `Cache-Control` + `ETag` on thumbnails and vendored assets | Small |
 
+> **Status:** items 1 and 2 are now fixed (see "Changes made" below).
+
 Items 1 and 2 are probably the main cause of "viewing the timeline is very slow", and they have nothing to do with the graphics card. Item 4 is the part that is specific to having no GPU.
+
+## Changes made
+
+**`relationships(to_item_id)` index + removal of `GROUP BY items.id`** (`timeline/schema.sql`, `timeline/search.go`):
+
+* Added `idx_relationships_to_item_id`. `schema.sql` runs every time a timeline is opened, so existing timelines get the index on their next start (a one-time build that can take seconds to minutes on a large library).
+* The search query no longer joins `relationships`, `relations` or `embeddings`, and no longer uses `GROUP BY items.id`:
+  * the "root items only" and relation-label filters (for example "not motion") became one `EXISTS` / `NOT EXISTS` subquery on the item's incoming relationships, with the same matching rules as before;
+  * "has embedding" became a scalar subquery;
+  * the entity is chosen with a subquery that picks one `entity_attributes` link (preferring an entity that is being filtered for). An attribute linked to the same entity on several data sources previously produced duplicate rows, which only `GROUP BY` removed.
+* Fixed while in there: `to_attribute_id` / `to_entity_id` searches ("items sent to X") always failed. Combined with the default root-items mode they gave `no such column: relations.directed`, and `to_entity_id` referenced a column that doesn't exist. They now work.
+* New tests in `timeline/search_test.go` cover result rows, ordering, totals, entities, embeddings and the query plan (no full scans of `items`/`relationships`). Every case except the two broken "sent to" filters gives the same results on the old code.
+
+Measured on a synthetic timeline of 200,000 items and 150,000 relationships:
+
+| Query | Before | After |
+|---|---|---|
+| Timeline: one day, `related=1` (72 items) | 550 ms | 28 ms |
+| One week, `related=1` (504 items) | 3,448 ms | 123 ms |
+| Newest 100 items, `related=1` | 1,094 ms | 22 ms |
+| "Find latest item" pre-search (`limit 1`) | 323 ms | ~350 ms (not fixed, see 1.6) |
 
 ---
 
@@ -21,7 +44,7 @@ Items 1 and 2 are probably the main cause of "viewing the timeline is very slow"
 
 I loaded `timeline/schema.sql` into SQLite 3.53 and ran `EXPLAIN QUERY PLAN` on the queries the timeline page actually sends (with representative `sqlite_stat1` row counts).
 
-### 1.1 Missing index: `relationships.to_item_id` (critical)
+### 1.1 Missing index: `relationships.to_item_id` (critical) — **FIXED**
 
 `schema.sql` indexes only `relationships.from_item_id`. Two hot queries filter on `to_item_id`:
 
@@ -58,7 +81,7 @@ Also consider these, depending on which filters are used:
 * `items(attribute_id)`, used for the entity page ("items by this person") and the attribute FK.
 * `items(classification_id)`, used by the "item class" filter on the timeline.
 
-### 1.2 `GROUP BY items.id` disables the timestamp index (critical)
+### 1.2 `GROUP BY items.id` disables the timestamp index (critical) — **FIXED**
 
 Every non-count search ends with `GROUP BY items.id` (`search.go`, just before `ORDER BY`). It exists only to remove duplicate rows produced by the `LEFT JOIN relationships`. The side effect is that SQLite walks `items` in rowid order to do the grouping, so it **ignores `idx_items_timestamp`**, reads every item, and then sorts:
 
@@ -108,7 +131,14 @@ Fix: after the main query, collect all result IDs and fetch every relationship i
 
 The view computes `day_of_year`, `week_of_year` and `month_of_year` with `strftime(date(...))` and joins `data_sources`/`classifications`. SQLite evaluates view columns lazily, so this is cheap if nothing references them. Still worth checking that `itemDBColumns` does not select them in the hot path; if it does, that is three `strftime` calls per row.
 
-### 1.6 SQLite connection settings
+### 1.6 `extended_items` view causes a bad plan for very small limits
+
+Found while measuring the fixes above. With `LIMIT 1` or `LIMIT 2`, which the timeline's "find the most recent item" pre-search uses, SQLite walks `items` in `(data_source_id, original_id)` order to suit the view's join to `data_sources`, and then sorts the whole table. The same query with `LIMIT 100`, or against `items` directly without the view, takes under 1 ms. Possible fixes:
+
+* redefine `extended_items` to get `data_source_name`/`data_source_title`/`classification_name` through scalar subqueries instead of `LEFT JOIN`s (needs a `DROP VIEW` + `CREATE VIEW` migration, because `schema.sql` uses `IF NOT EXISTS`); or
+* have the pre-search request a few more rows (for example `limit: 10`) and use the first.
+
+### 1.7 SQLite connection settings
 
 In `timeline/db.go`:
 

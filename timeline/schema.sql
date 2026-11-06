@@ -244,6 +244,11 @@ CREATE TABLE IF NOT EXISTS "relationships" (
 -- and this way only 1 index is necessary, not multiple on the various fields we check for uniqueness
 CREATE INDEX IF NOT EXISTS "idx_relationships_from_item_id" ON "relationships"("from_item_id");
 
+-- Searches look up each item's incoming relationships (e.g. to hide attachments and motion pictures
+-- from the top level of results, and to load related items), and deleting an item cascades to the
+-- relationships that point to it; without this index, each of those is a full scan of this table.
+CREATE INDEX IF NOT EXISTS "idx_relationships_to_item_id" ON "relationships"("to_item_id");
+
 -- Relations define the way relationships connect. They are described by natural
 -- language phrases such as "in reply to", "picture of", or "attached to"; or could
 -- be words like "siblings", "coworkers", or "related". Relations will either be
